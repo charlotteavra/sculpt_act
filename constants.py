@@ -1,10 +1,10 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = "/Users/charlotteavra/clay_project/act/data"
+DATA_DIR = "/home/charlotte/sculpt_act/data"
 TASK_CONFIGS = {
     "clay_sculpting": {
-        "dataset_dir": DATA_DIR + "/clay_sculpting/Jan27_Discrete_Demos/Cone/Discrete",
+        "dataset_dir": DATA_DIR + "/clay_sculpting/Jan27_Discrete_Demos/X/Discrete",
         "num_episodes": 5,
         "episode_len": 10,
         "camera_names": ["top"],

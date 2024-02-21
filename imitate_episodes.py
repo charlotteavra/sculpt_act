@@ -16,8 +16,6 @@ from utils import compute_dict_mean, set_seed, detach_dict  # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
 from visualize_episodes import save_videos
 
-from sim_env import BOX_POSE
-
 import IPython
 
 e = IPython.embed
@@ -376,7 +374,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
-    policy.to(torch.device("mps"))
+    policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
@@ -426,10 +424,10 @@ def train_bc(train_dataloader, val_dataloader, config):
             summary_string += f"{k}: {v.item():.3f} "
         print(summary_string)
 
-        if epoch % 100 == 0:
+        if epoch % 50 == 0:
             ckpt_path = os.path.join(ckpt_dir, f"policy_epoch_{epoch}_seed_{seed}.ckpt")
             torch.save(policy.state_dict(), ckpt_path)
-            # plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
+            plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
 
     ckpt_path = os.path.join(ckpt_dir, f"policy_last.ckpt")
     torch.save(policy.state_dict(), ckpt_path)

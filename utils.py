@@ -133,7 +133,8 @@ class ClayDataset(torch.utils.data.Dataset):
         """
         Single stitched pointcloud of the state
 
-        :param state_path: Absolute path to raw point cloud states
+        :param[in] state_path(str): Absolute path to raw point cloud states
+        :param[out] pointcloud(o3d.geometry.PointCloud): Stitched pointcloud 
         """
 
         pc2 = o3d.io.read_point_cloud(state_path + "pc_cam2.ply")
@@ -201,56 +202,73 @@ class ClayDataset(torch.utils.data.Dataset):
 
     def _rotate_pcl(self, state, center, rot):
         """
-        Faster implementation of rotation augmentation to fix slow down issue
+        Rotation augmentation for pointcloud
+
+        :param[in] state(o3d.geometry.PointCloud): Input pointcloud state to be augmented
+        :param[in] ctr(numpy.ndarray): (3,) Center location of input pointcloud [x,y,z]
+        :param[in] rot(float): Desired rotation of input pointcloud (in degrees)
+        :param[out] pcl_aug(numpy.ndarray): (n,3) Augmented pointcloud in array form
         """
         state = state.points - center
-        R = Rotation.from_euler(
-            "xyz", np.array([0, 0, math.radians(rot)]), degrees=True
-        ).as_matrix()
+        R = Rotation.from_euler('xyz', np.array([0, 0, rot]), degrees=True).as_matrix()
         state = R @ state.T
         pcl_aug = state.T + center
         return pcl_aug
 
     def _rotate_action(self, action, center, rot):
-        unit_circle_og_grasp = (action[0] - center[0], action[1] - center[1])
-        rot_original = math.atan2(unit_circle_og_grasp[1], unit_circle_og_grasp[0])
-        unit_circle_radius = math.sqrt(
-            unit_circle_og_grasp[0] ** 2 + unit_circle_og_grasp[1] ** 2
-        )
-        rot_new = rot_original + rot
-        new_unit_circle_grasp = (
-            -unit_circle_radius * math.cos(math.radians(rot_new)),
-            -unit_circle_radius * math.sin(math.radians(rot_new)),
-        )
+       """
+       Rotation augmentation for action
 
-        new_global_grasp = (
-            center[0] + new_unit_circle_grasp[0],
-            center[1] + new_unit_circle_grasp[1],
-        )
-        x = new_global_grasp[0]
-        y = new_global_grasp[1]
-        rz = action[3] + rot
-        rz = wrap_rz(rz)
-        action_aug = np.array([x, y, action[2], rz, action[4]])
-        return action_aug
+       :param[in] action(numpy.ndarray): (5,) Action to be augmented [x,y,z,z_rotation,gripper_distance]
+       :param[in] center(numpy.ndarray): (3,) Center location of state pointcloud [x,y,z]
+       :param[in] rot(float): Desired rotation of input pointcloud (in degrees)
+       :param[out] action(numpy.ndarray): (5,) Rotation augmented action [x,y,z,z_rotation,gripper_distance]
+       """
+       unit_circle_og_grasp = (action[0] - center[0], action[1] - center[1])
+       rot_original = math.degrees(math.atan2(unit_circle_og_grasp[1], unit_circle_og_grasp[0]))
+       unit_circle_radius = math.sqrt(unit_circle_og_grasp[0]**2 + unit_circle_og_grasp[1]**2)
+       rot_new =  rot_original + rot
+
+       new_unit_circle_grasp = (unit_circle_radius*math.cos(math.radians(rot_new)), unit_circle_radius*math.sin(math.radians(rot_new)))
+    
+       new_global_grasp = (center[0] + new_unit_circle_grasp[0], center[1] + new_unit_circle_grasp[1])
+       x = new_global_grasp[0]
+       y = new_global_grasp[1]
+       rz = action[3] + rot
+       rz = wrap_rz(rz)
+       action_aug = np.array([x, y, action[2], rz, action[4]])
+        
+       return action_aug
 
     def _convert_state_to_image(self, points, colors):
         """
         Converts input state into a top view image
 
-        :param[in] points(o3d.Vector3dVector): (n,3) shape array of pointcloud points
-        :param[in] colors(o3d.Vector3dVector): (n,3) shape array of pointcloud colors
+        :param[in] points(numpy.ndarray): (n,3) shape array of pointcloud points
+        :param[in] colors(numpy.ndarray): (n,3) shape array of pointcloud colors
         :param[out] (numpy.ndarray): top view RGB image of state
         """
 
-        state = o3d.geometry.PointCloud()
-        state.points = points
-        state.colors = colors
+        colors = colors.reshape(-1, 3)
+        res = 256
+        pts_norm = (
+            (points - np.min(points)) * (res / (np.max(points) - np.min(points)))
+        ).astype(int)
+        img_arr = np.ones((res, res, 3), dtype=np.float32)
 
-        visualizer = o3d.visualization.Visualizer()
-        visualizer.create_window()
-        visualizer.add_geometry(state)
-        img_arr = visualizer.capture_screen_float_buffer(True)
+        x_coords, y_coords = pts_norm[:, 0], pts_norm[:, 1]
+
+        valid_indices = np.where(
+            (0 <= x_coords) & (x_coords < res) & (0 <= y_coords) & (y_coords < res)
+        )
+
+        img_arr[y_coords[valid_indices], x_coords[valid_indices]] = np.hstack(
+            [
+                colors[valid_indices, 2].reshape(len(valid_indices[0]), 1),
+                colors[valid_indices, 1].reshape(len(valid_indices[0]), 1),
+                colors[valid_indices, 0].reshape(len(valid_indices[0]), 1),
+            ]
+        ) # this line also converts RGB <-> BGR
 
         return img_arr
 
@@ -307,9 +325,7 @@ class ClayDataset(torch.utils.data.Dataset):
         state = states[start_ts]
         s_rot = self._rotate_pcl(state, ctr, aug_rot)  # apply state rotation
         s_rot_scaled = self._center_pcl(s_rot, ctr)  # center and scale state
-        img_arr = self._convert_state_to_image(
-            o3d.utility.Vector3dVector(s_rot_scaled), state.colors
-        )
+        img_arr = self._convert_state_to_image(s_rot_scaled, np.asarray(state.colors))
         all_cam_images = np.stack([img_arr], axis=0)
 
         # # load uncentered goal
