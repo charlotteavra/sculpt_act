@@ -1,14 +1,23 @@
 import pathlib
+import numpy as np
 
 ### Task parameters
 DATA_DIR = "/home/charlotte/sculpt_act/data"
 TASK_CONFIGS = {
     "clay_sculpting": {
-        "dataset_dir": DATA_DIR + "/clay_sculpting/Jan27_Discrete_Demos/X/Discrete",
+        "dataset_dir": DATA_DIR + "/clay_sculpting/Feb24_Discrete_Demos/X/Discrete",
         "num_episodes": 5,
         "episode_len": 10,
         "camera_names": ["top"],
     }
+}
+HARDWARE_CONFIGS = {
+    "observation_pose": np.array([0.6, 0, 0.325]),
+    "initial_action": np.array([0.6, 0.0, 0.165, 0.0, 0.05]),
+    "a_mins5d": np.array([0.56, -0.062, 0.125, -90, 0.005]),
+    "a_maxs5d": np.array([0.7, 0.062, 0.165, 90, 0.05]),
+    "table_center_top": np.array([0.63, 0.0, 0.045]),
+    "gripper_z": 0.2,
 }
 SIM_TASK_CONFIGS = {
     "sim_transfer_cube_scripted": {

@@ -4,8 +4,11 @@ import math
 import os
 import open3d as o3d
 import h5py
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial.transform import Rotation
 from torch.utils.data import DataLoader
+from constants import HARDWARE_CONFIGS
+
 
 import IPython
 
@@ -120,6 +123,7 @@ class ClayDataset(torch.utils.data.Dataset):
         self.n_raw_trajectories = n_raw_trajectories
         self.center_action = center_action
         self.stopping_token = stopping_token
+        self.hardware_config = HARDWARE_CONFIGS
 
         # determine the number of datapoints per trajectory - needs to be a round number
         self.n_datapoints_per_trajectory = int(
@@ -128,54 +132,6 @@ class ClayDataset(torch.utils.data.Dataset):
 
         # deterime the augmentation interval
         self.aug_step = 360 / self.n_datapoints_per_trajectory
-
-    def _stitch_state_pcls(self, state_path):
-        """
-        Single stitched pointcloud of the state
-
-        :param[in] state_path(str): Absolute path to raw point cloud states
-        :param[out] pointcloud(o3d.geometry.PointCloud): Stitched pointcloud 
-        """
-
-        pc2 = o3d.io.read_point_cloud(state_path + "pc_cam2.ply")
-        pc3 = o3d.io.read_point_cloud(state_path + "pc_cam3.ply")
-        pc4 = o3d.io.read_point_cloud(state_path + "pc_cam4.ply")
-        pc5 = o3d.io.read_point_cloud(state_path + "pc_cam5.ply")
-
-        # combine the point clouds
-        pointcloud = o3d.geometry.PointCloud()
-        pointcloud.points = pc5.points
-        pointcloud.colors = pc5.colors
-        pointcloud.points.extend(pc2.points)
-        pointcloud.colors.extend(pc2.colors)
-        pointcloud.points.extend(pc3.points)
-        pointcloud.colors.extend(pc3.colors)
-        pointcloud.points.extend(pc4.points)
-        pointcloud.colors.extend(pc4.colors)
-
-        # remove grippers
-        points = np.asarray(pointcloud.points)
-        colors = np.asarray(pointcloud.colors)
-
-        ind_z = np.where((points[:, 2] > 0.065) & (points[:, 2] < 0.3))
-        pointcloud.points = o3d.utility.Vector3dVector(points[ind_z])
-        pointcloud.colors = o3d.utility.Vector3dVector(colors[ind_z])
-
-        # remove background
-        radius = 0.17
-        center = (
-            np.array([0.6, -0.05, 0.3]),
-        )  # change radius to 0.3 if you want the goal shape to be in frame
-        points = np.asarray(pointcloud.points)
-        colors = np.asarray(pointcloud.colors)
-
-        distances = np.linalg.norm(points - center, axis=1)
-        indices = np.where(distances <= radius)
-
-        pointcloud.points = o3d.utility.Vector3dVector(points[indices])
-        pointcloud.colors = o3d.utility.Vector3dVector(colors[indices])
-
-        return pointcloud
 
     def _center_pcl(self, pcl, center):
         centered_pcl = pcl - center
@@ -195,8 +151,8 @@ class ClayDataset(torch.utils.data.Dataset):
         return norm_action
 
     def _normalize_action(self, action):
-        a_mins5d = np.array([0.55, -0.035, 0.19, -90, 0.005])
-        a_maxs5d = np.array([0.63, 0.035, 0.25, 90, 0.05])
+        a_mins5d = self.hardware_config["a_mins5d"]
+        a_maxs5d = self.hardware_config["a_maxs5d"]
         norm_action = (action - a_mins5d) / (a_maxs5d - a_mins5d)
         return norm_action
 
@@ -210,67 +166,45 @@ class ClayDataset(torch.utils.data.Dataset):
         :param[out] pcl_aug(numpy.ndarray): (n,3) Augmented pointcloud in array form
         """
         state = state.points - center
-        R = Rotation.from_euler('xyz', np.array([0, 0, rot]), degrees=True).as_matrix()
+        R = Rotation.from_euler("xyz", np.array([0, 0, rot]), degrees=True).as_matrix()
         state = R @ state.T
         pcl_aug = state.T + center
         return pcl_aug
 
     def _rotate_action(self, action, center, rot):
-       """
-       Rotation augmentation for action
-
-       :param[in] action(numpy.ndarray): (5,) Action to be augmented [x,y,z,z_rotation,gripper_distance]
-       :param[in] center(numpy.ndarray): (3,) Center location of state pointcloud [x,y,z]
-       :param[in] rot(float): Desired rotation of input pointcloud (in degrees)
-       :param[out] action(numpy.ndarray): (5,) Rotation augmented action [x,y,z,z_rotation,gripper_distance]
-       """
-       unit_circle_og_grasp = (action[0] - center[0], action[1] - center[1])
-       rot_original = math.degrees(math.atan2(unit_circle_og_grasp[1], unit_circle_og_grasp[0]))
-       unit_circle_radius = math.sqrt(unit_circle_og_grasp[0]**2 + unit_circle_og_grasp[1]**2)
-       rot_new =  rot_original + rot
-
-       new_unit_circle_grasp = (unit_circle_radius*math.cos(math.radians(rot_new)), unit_circle_radius*math.sin(math.radians(rot_new)))
-    
-       new_global_grasp = (center[0] + new_unit_circle_grasp[0], center[1] + new_unit_circle_grasp[1])
-       x = new_global_grasp[0]
-       y = new_global_grasp[1]
-       rz = action[3] + rot
-       rz = wrap_rz(rz)
-       action_aug = np.array([x, y, action[2], rz, action[4]])
-        
-       return action_aug
-
-    def _convert_state_to_image(self, points, colors):
         """
-        Converts input state into a top view image
+        Rotation augmentation for action
 
-        :param[in] points(numpy.ndarray): (n,3) shape array of pointcloud points
-        :param[in] colors(numpy.ndarray): (n,3) shape array of pointcloud colors
-        :param[out] (numpy.ndarray): top view RGB image of state
+        :param[in] action(numpy.ndarray): (5,) Action to be augmented [x,y,z,z_rotation,gripper_distance]
+        :param[in] center(numpy.ndarray): (3,) Center location of state pointcloud [x,y,z]
+        :param[in] rot(float): Desired rotation of input pointcloud (in degrees)
+        :param[out] action(numpy.ndarray): (5,) Rotation augmented action [x,y,z,z_rotation,gripper_distance]
         """
+        unit_circle_og_grasp = (action[0] - center[0], action[1] - center[1])
+        rot_original = math.degrees(
+            math.atan2(unit_circle_og_grasp[1], unit_circle_og_grasp[0])
+        )
+        unit_circle_radius = math.sqrt(
+            unit_circle_og_grasp[0] ** 2 + unit_circle_og_grasp[1] ** 2
+        )
+        rot_new = rot_original + rot
 
-        colors = colors.reshape(-1, 3)
-        res = 256
-        pts_norm = (
-            (points - np.min(points)) * (res / (np.max(points) - np.min(points)))
-        ).astype(int)
-        img_arr = np.ones((res, res, 3), dtype=np.float32)
-
-        x_coords, y_coords = pts_norm[:, 0], pts_norm[:, 1]
-
-        valid_indices = np.where(
-            (0 <= x_coords) & (x_coords < res) & (0 <= y_coords) & (y_coords < res)
+        new_unit_circle_grasp = (
+            unit_circle_radius * math.cos(math.radians(rot_new)),
+            unit_circle_radius * math.sin(math.radians(rot_new)),
         )
 
-        img_arr[y_coords[valid_indices], x_coords[valid_indices]] = np.hstack(
-            [
-                colors[valid_indices, 2].reshape(len(valid_indices[0]), 1),
-                colors[valid_indices, 1].reshape(len(valid_indices[0]), 1),
-                colors[valid_indices, 0].reshape(len(valid_indices[0]), 1),
-            ]
-        ) # this line also converts RGB <-> BGR
+        new_global_grasp = (
+            center[0] + new_unit_circle_grasp[0],
+            center[1] + new_unit_circle_grasp[1],
+        )
+        x = new_global_grasp[0]
+        y = new_global_grasp[1]
+        rz = action[3] + rot
+        rz = wrap_rz(rz)
+        action_aug = np.array([x, y, action[2], rz, action[4]])
 
-        return img_arr
+        return action_aug
 
     def __len__(self):
         """
@@ -279,8 +213,6 @@ class ClayDataset(torch.utils.data.Dataset):
         return len(self.episode_idxs)
 
     def __getitem__(self, index):
-        sample_full_episode = True  # hardcode
-
         # built in ACT functionality to determine idx randomness
         idx = self.episode_idxs[index]
 
@@ -298,34 +230,32 @@ class ClayDataset(torch.utils.data.Dataset):
         # iterate loading in the actions as long as the next state point cloud exists
         while os.path.exists(traj_path + "/state" + str(j) + ".npy"):
             ctr = np.load(traj_path + "/pcl_center" + str(j) + ".npy")
-            s = self._stitch_state_pcls(traj_path + "/Raw_State" + str(j) + "/")
+
+            state_path = traj_path + "/Raw_State" + str(j) + "/"
+            pc2 = o3d.io.read_point_cloud(state_path + "pc_cam2.ply")
+            pc3 = o3d.io.read_point_cloud(state_path + "pc_cam3.ply")
+            pc4 = o3d.io.read_point_cloud(state_path + "pc_cam4.ply")
+            pc5 = o3d.io.read_point_cloud(state_path + "pc_cam5.ply")
+            s = stitch_state_pcls(pc2, pc3, pc4, pc5)
             states.append(s)  # append to state list
 
             if j != 0:
+                # apply action augmentation
                 a = np.load(traj_path + "/action" + str(j - 1) + ".npy")
                 a_rot = self._rotate_action(a, ctr, aug_rot)  # apply action rotation
-
-                # normalize action (can choose between normalization strategies)
-                if self.center_action:
-                    a_scaled = self._center_normalize_action(a_rot, ctr)
-                else:
-                    a_scaled = self._normalize_action(a_rot)
-
-                # add stopping token if necessary
-                if self.stopping_token:
-                    # set the stopping token
-                    # action[5] = int(stopping == True)
-                    pass
-
+                a_scaled = self._normalize_action(a_rot)
                 actions.append(a_scaled)
             j += 1
 
         episode_len = len(actions)
-        start_ts = np.random.choice(episode_len)
+        start_ts = np.random.choice(episode_len)  # random starting point in trajectory
         state = states[start_ts]
+
+        # apply state augmentation
         s_rot = self._rotate_pcl(state, ctr, aug_rot)  # apply state rotation
         s_rot_scaled = self._center_pcl(s_rot, ctr)  # center and scale state
-        img_arr = self._convert_state_to_image(s_rot_scaled, np.asarray(state.colors))
+
+        img_arr = convert_state_to_image(s_rot_scaled, np.asarray(state.colors))
         all_cam_images = np.stack([img_arr], axis=0)
 
         # # load uncentered goal
@@ -337,7 +267,11 @@ class ClayDataset(torch.utils.data.Dataset):
 
         action = actions[start_ts:]
         action = np.stack(action, axis=0)
-        prev_action = actions[start_ts - 1]
+
+        if start_ts > 0:
+            prev_action = actions[start_ts - 1]
+        else:
+            prev_action = self.hardware_config["initial_action"]
 
         action_len = episode_len - start_ts
 
@@ -364,6 +298,84 @@ class ClayDataset(torch.utils.data.Dataset):
         # ]
 
         return image_data, prev_action_data, action_data, is_pad
+
+
+def stitch_state_pcls(pc2, pc3, pc4, pc5):
+    """
+    Single stitched pointcloud of the state
+
+    :param[in] state_path(str): Absolute path to raw point cloud states
+    :param[out] pointcloud(o3d.geometry.PointCloud): Stitched pointcloud
+    """
+
+    # combine the point clouds
+    pointcloud = o3d.geometry.PointCloud()
+    pointcloud.points = pc5.points
+    pointcloud.colors = pc5.colors
+    pointcloud.points.extend(pc2.points)
+    pointcloud.colors.extend(pc2.colors)
+    pointcloud.points.extend(pc3.points)
+    pointcloud.colors.extend(pc3.colors)
+    pointcloud.points.extend(pc4.points)
+    pointcloud.colors.extend(pc4.colors)
+
+    # remove grippers
+    points = np.asarray(pointcloud.points)
+    colors = np.asarray(pointcloud.colors)
+
+    hardware_config = HARDWARE_CONFIGS
+    table_z = hardware_config["table_center_top"][2]
+    gripper_z = hardware_config["gripper_z"]
+    ind_z = np.where((points[:, 2] > table_z) & (points[:, 2] < gripper_z))
+    pointcloud.points = o3d.utility.Vector3dVector(points[ind_z])
+    pointcloud.colors = o3d.utility.Vector3dVector(colors[ind_z])
+
+    # remove background
+    radius = 0.12
+    center = hardware_config["table_center_top"]
+    points = np.asarray(pointcloud.points)
+    colors = np.asarray(pointcloud.colors)
+
+    distances = np.linalg.norm(points - center, axis=1)
+    indices = np.where(distances <= radius)
+
+    pointcloud.points = o3d.utility.Vector3dVector(points[indices])
+    pointcloud.colors = o3d.utility.Vector3dVector(colors[indices])
+
+    return pointcloud
+
+
+def convert_state_to_image(points, colors):
+    """
+    Converts input state into a top view image
+
+    :param[in] points(numpy.ndarray): (n,3) shape array of pointcloud points
+    :param[in] colors(numpy.ndarray): (n,3) shape array of pointcloud colors
+    :param[out] (numpy.ndarray): top view RGB image of state
+    """
+
+    colors = colors.reshape(-1, 3)
+    res = 256
+    pts_norm = (
+        (points - np.min(points)) * (res / (np.max(points) - np.min(points)))
+    ).astype(int)
+    img_arr = np.ones((res, res, 3), dtype=np.float32)
+
+    x_coords, y_coords = pts_norm[:, 0], pts_norm[:, 1]
+
+    valid_indices = np.where(
+        (0 <= x_coords) & (x_coords < res) & (0 <= y_coords) & (y_coords < res)
+    )
+
+    img_arr[y_coords[valid_indices], x_coords[valid_indices]] = np.hstack(
+        [
+            colors[valid_indices, 2].reshape(len(valid_indices[0]), 1),
+            colors[valid_indices, 1].reshape(len(valid_indices[0]), 1),
+            colors[valid_indices, 0].reshape(len(valid_indices[0]), 1),
+        ]
+    )  # this line also converts RGB <-> BGR
+
+    return img_arr
 
 
 def wrap_rz(original_rz):
@@ -451,26 +463,37 @@ def load_data(
 def load_clay_data(dataset_dir, num_episodes, batch_size_train, batch_size_val):
     print(f"\nData from: {dataset_dir}\n")
 
+    train_dir = dataset_dir + "/Train"
+    val_dir = dataset_dir + "/Test"
+
+    # number of trajectories in each directory
+    num_train_epidodes = len(next(os.walk(train_dir))[1])
+    num_val_epidodes = len(next(os.walk(val_dir))[1])
+    train_ratio = num_train_epidodes / (num_train_epidodes + num_val_epidodes)
+
     # obtain train test split
-    shuffled_indices = np.random.permutation(num_episodes)
-    train_ratio = 0.8
-    train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
-    val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
+    # shuffled_indices = np.random.permutation(num_episodes)
+    # train_ratio = 0.8
+    # train_indices = shuffled_indices[: int(train_ratio * num_episodes)]
+    # val_indices = shuffled_indices[int(train_ratio * num_episodes) :]
 
     # define number of ideal final trajectories through augmentation
-    num_total_aug_trajectories = 500
+    num_total_aug_trajectories = 800
     train_total_aug_trajectories = int(train_ratio * num_total_aug_trajectories)
     val_total_aug_trajectories = int((1 - train_ratio) * num_total_aug_trajectories)
+
+    train_indices = np.arange(0, num_train_epidodes, step=1)
+    val_indices = np.arange(0, num_val_epidodes, step=1)
 
     # construct dataset and dataloader
     train_dataset = ClayDataset(
         train_indices,
-        dataset_dir,
+        train_dir,
         train_total_aug_trajectories,
         num_episodes,
     )
     val_dataset = ClayDataset(
-        val_indices, dataset_dir, val_total_aug_trajectories, num_episodes
+        val_indices, val_dir, val_total_aug_trajectories, num_episodes
     )
 
     train_dataloader = DataLoader(
@@ -491,6 +514,76 @@ def load_clay_data(dataset_dir, num_episodes, batch_size_train, batch_size_val):
     )
 
     return train_dataloader, val_dataloader
+
+
+### pcl utils
+
+
+def chamfer(x, y, pkg="numpy"):
+    """ """
+    if pkg == "numpy":
+        # numpy implementation
+        x = np.repeat(np.expand_dims(x, axis=1), y.shape[0], axis=1)  # x: [N, M, D]
+        y = np.repeat(np.expand_dims(y, axis=0), x.shape[0], axis=0)  # y: [N, M, D]
+        dis = np.linalg.norm(x - y, 2, axis=2)
+        dis_xy = np.mean(np.min(dis, axis=1))  # dis_xy: mean over N
+        dis_yx = np.mean(np.min(dis, axis=0))  # dis_yx: mean over M
+    else:
+        # torch implementation
+        x = x[:, None, :].repeat(1, y.size(0), 1)  # x: [N, M, D]
+        y = y[None, :, :].repeat(x.size(0), 1, 1)  # y: [N, M, D]
+        dis = torch.norm(torch.add(x, -y), 2, dim=2)  # dis: [N, M]
+        dis_xy = torch.mean(torch.min(dis, dim=1)[0])  # dis_xy: mean over N
+        dis_yx = torch.mean(torch.min(dis, dim=0)[0])  # dis_yx: mean over M
+
+    return dis_xy + dis_yx
+
+
+def emd(x, y, pkg="numpy"):
+    if pkg == "numpy":
+        # numpy implementation
+        x_ = np.repeat(np.expand_dims(x, axis=1), y.shape[0], axis=1)  # x: [N, M, D]
+        y_ = np.repeat(np.expand_dims(y, axis=0), x.shape[0], axis=0)  # y: [N, M, D]
+        cost_matrix = np.linalg.norm(x_ - y_, 2, axis=2)
+        try:
+            ind1, ind2 = linear_sum_assignment(cost_matrix, maximize=False)
+        except:
+            # pdb.set_trace()
+            print("Error in linear sum assignment!")
+        emd = np.mean(np.linalg.norm(x[ind1] - y[ind2], 2, axis=1))
+    else:
+        # torch implementation
+        x_ = x[:, None, :].repeat(1, y.size(0), 1)  # x: [N, M, D]
+        y_ = y[None, :, :].repeat(x.size(0), 1, 1)  # y: [N, M, D]
+        dis = torch.norm(torch.add(x_, -y_), 2, dim=2)  # dis: [N, M]
+        cost_matrix = dis.detach().cpu().numpy()
+        try:
+            ind1, ind2 = linear_sum_assignment(cost_matrix, maximize=False)
+        except:
+            # pdb.set_trace()
+            print("Error in linear sum assignment!")
+
+        emd = torch.mean(torch.norm(torch.add(x[ind1], -y[ind2]), 2, dim=1))
+
+    return emd
+
+
+def hausdorff(x, y, pkg="numpy"):
+    if pkg == "numpy":
+        x = np.repeat(np.expand_dims(x, axis=1), y.shape[0], axis=1)  # x: [N, M, D]
+        y = np.repeat(np.expand_dims(y, axis=0), x.shape[0], axis=0)  # y: [N, M, D]
+        dis = np.linalg.norm(x - y, 2, axis=2)
+        dis_xy = np.max(np.min(dis, axis=1))  # dis_xy: mean over N
+        dis_yx = np.max(np.min(dis, axis=0))  # dis_yx: mean over M
+    else:
+        # torch implementation
+        x = x[:, None, :].repeat(1, y.size(0), 1)  # x: [N, M, D]
+        y = y[None, :, :].repeat(x.size(0), 1, 1)  # y: [N, M, D]
+        dis = torch.norm(torch.add(x, -y), 2, dim=2)  # dis: [N, M]
+        dis_xy = torch.max(torch.min(dis, dim=1)[0])  # dis_xy: mean over N
+        dis_yx = torch.max(torch.min(dis, dim=0)[0])  # dis_yx: mean over M
+
+    return dis_xy + dis_yx
 
 
 ### env utils
