@@ -11,6 +11,7 @@ import open3d as o3d
 import pyrealsense2 as rs
 import robomail.vision as vis
 from frankapy import FrankaArm
+from constants import DATA_DIR
 from constants import TASK_CONFIGS
 from constants import HARDWARE_CONFIGS
 from imitate_episodes import make_policy
@@ -87,21 +88,13 @@ def main(args):
         "hardware_config": hardware_config,
     }
 
-    # -------------------------------------------------------------------
-    # ---------------- Experimental Parameters to Define ----------------
-    # -------------------------------------------------------------------
     exp_num = 1
-    goal_shape = "X"  # 'cone' or 'line' or 'X' or 'Y' or 'cylinder
-    # -------------------------------------------------------------------
-    # -------------------------------------------------------------------
-    # -------------------------------------------------------------------
-
-    exp_save = "/Experiments/Exp" + str(exp_num)
+    exp_save = "experiments/exp" + str(exp_num)
 
     # check to make sure the experiment number is not already in use, if it is, increment the number to ensure no save overwrites
     while os.path.exists(exp_save):
         exp_num += 1
-        exp_save = "/Experiments/Exp" + str(exp_num)
+        exp_save = "experiments/exp" + str(exp_num)
     os.mkdir(exp_save)
 
     # initialize the robot and reset joints
@@ -125,11 +118,10 @@ def main(args):
     config.enable_stream(rs.stream.color, W, H, rs.format.bgr8, 30)
     pipeline.start(config)
 
-    # initialize the 3D vision code
-    pcl_vis = vis.Vision3D()
-
     # load in the goal and save to the experiment folder
-    goal = np.load("path/to/goal/goal.npy")
+    goal_shape = "X"  # 'cone' or 'line' or 'X' or 'Y' or 'cylinder
+    goal_shape_path = goal_shape + ".npy"
+    goal = np.load(os.path.join(DATA_DIR, "clay_sculpting/goals/", goal_shape_path))
     np.save(exp_save + "/goal.npy", goal)
 
     # initialize the threads
@@ -141,7 +133,6 @@ def main(args):
             robot,
             cameras,
             experiment_config,
-            pcl_vis,
             exp_save,
             goal,
             done_queue,
@@ -155,14 +146,13 @@ def main(args):
     video_thread.start()
 
 
-def experiment_loop(
-    robot, cameras, experiment_config, pcl_vis, save_path, goal, done_queue
-):
+def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_queue):
     """ """
     hardware_config = experiment_config["hardware_config"]
     observation_pose = hardware_config["observation_pose"]
     a_mins5d = hardware_config["a_mins5d"]
     a_maxs5d = hardware_config["a_maxs5d"]
+    policy_config = experiment_config["policy_config"]
     state_dim = policy_config["state_dim"]
 
     # go to observation pose
@@ -182,6 +172,11 @@ def experiment_loop(
     rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
     rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
+    pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
+    pc3.transform(cameras["3"].get_cam_extrinsics())
+    pc4.transform(cameras["4"].get_cam_extrinsics())
+    pc5.transform(cameras["5"].get_cam_extrinsics())
+
     o3d.io.write_point_cloud(save_path + "/cam2_pcl0.ply", pc2)
     o3d.io.write_point_cloud(save_path + "/cam3_pcl0.ply", pc3)
     o3d.io.write_point_cloud(save_path + "/cam4_pcl0.ply", pc4)
@@ -193,7 +188,9 @@ def experiment_loop(
     cv2.imwrite(save_path + "/rgb5_state0.jpg", rgb5)
 
     pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-    img_arr = convert_state_to_image(pointcloud.points, pointcloud.colors)
+    img_arr = convert_state_to_image(
+        np.asarray(pointcloud.points), np.asarray(pointcloud.colors)
+    )
     np.save(save_path + "/pcl0.npy", pointcloud)
     np.save(save_path + "/img0.npy", img_arr)
 
@@ -319,6 +316,11 @@ def experiment_loop(
             rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
             rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
+            pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
+            pc3.transform(cameras["3"].get_cam_extrinsics())
+            pc4.transform(cameras["4"].get_cam_extrinsics())
+            pc5.transform(cameras["5"].get_cam_extrinsics())
+
             o3d.io.write_point_cloud(save_path + "/cam2_pcl" + str(t + 1) + ".ply", pc2)
             o3d.io.write_point_cloud(save_path + "/cam3_pcl" + str(t + 1) + ".ply", pc3)
             o3d.io.write_point_cloud(save_path + "/cam4_pcl" + str(t + 1) + ".ply", pc4)
@@ -332,7 +334,9 @@ def experiment_loop(
             cv2.imwrite(save_path + "/rgb5_state" + str(t + 1) + ".jpg", rgb5)
 
             pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-            img_arr = convert_state_to_image(pointcloud.points, pointcloud.colors)
+            img_arr = convert_state_to_image(
+                np.asarray(pointcloud.points), np.asarray(pointcloud.colors)
+            )
             np.save(save_path + "/pcl0.npy", pointcloud)
             np.save(save_path + "/pcl" + str(t + 1) + ".npy", pointcloud)
             np.save(save_path + "/img" + str(t + 1) + ".npy", img_arr)
@@ -415,4 +419,31 @@ if __name__ == "__main__":
     parser.add_argument(
         "--task_name", action="store", type=str, help="task_name", required=True
     )
+    parser.add_argument(
+        "--batch_size", action="store", type=int, help="batch_size", required=True
+    )
+    parser.add_argument("--seed", action="store", type=int, help="seed", required=True)
+    parser.add_argument(
+        "--num_epochs", action="store", type=int, help="num_epochs", required=True
+    )
+    parser.add_argument("--lr", action="store", type=float, help="lr", required=True)
+
+    # for ACT
+    parser.add_argument(
+        "--kl_weight", action="store", type=int, help="KL Weight", required=False
+    )
+    parser.add_argument(
+        "--chunk_size", action="store", type=int, help="chunk_size", required=False
+    )
+    parser.add_argument(
+        "--hidden_dim", action="store", type=int, help="hidden_dim", required=False
+    )
+    parser.add_argument(
+        "--dim_feedforward",
+        action="store",
+        type=int,
+        help="dim_feedforward",
+        required=False,
+    )
+    parser.add_argument("--temporal_agg", action="store_true")
     main(vars(parser.parse_args()))
