@@ -15,7 +15,14 @@ from constants import DATA_DIR
 from constants import TASK_CONFIGS
 from constants import HARDWARE_CONFIGS
 from imitate_episodes import make_policy
-from utils import chamfer, emd, hausdorff, stitch_state_pcls, convert_state_to_image
+from utils import (
+    chamfer,
+    emd,
+    hausdorff,
+    stitch_state_pcls,
+    convert_state_to_image,
+    center_pcl,
+)
 from robot_utils import get_real_action_from_normalized, goto_grasp
 
 """
@@ -121,7 +128,9 @@ def main(args):
     # load in the goal and save to the experiment folder
     goal_shape = "X"  # 'cone' or 'line' or 'X' or 'Y' or 'cylinder
     goal_shape_path = goal_shape + ".npy"
-    goal = np.load(os.path.join(DATA_DIR, "clay_sculpting/goals/", goal_shape_path))
+    goal = np.load(
+        os.path.join(DATA_DIR, "clay_sculpting/goals/", goal_shape_path)
+    )  # TODO: wrong goal
     np.save(exp_save + "/goal.npy", goal)
 
     # initialize the threads
@@ -172,6 +181,18 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
     rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
+    # distance metrics between point cloud and goal
+    # TODO: make pc copies -> unormalize_point_clouds
+    # TODO: lab color crop -> downsample
+    pointcloud_clay_only = ...  # TODO
+    cd = chamfer(pointcloud_clay_only, goal)
+    earthmovers = emd(pointcloud_clay_only, goal)
+    hausdorff_dist = hausdorff(pointcloud_clay_only, goal)
+    print("\nChamfer Distance: ", cd)
+    print("Earth Mover's Distance: ", earthmovers)
+    print("Hausdorff Distance: ", hausdorff_dist)
+
+    # processing for pointcloud to image
     pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
     pc3.transform(cameras["3"].get_cam_extrinsics())
     pc4.transform(cameras["4"].get_cam_extrinsics())
@@ -188,18 +209,14 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     cv2.imwrite(save_path + "/rgb5_state0.jpg", rgb5)
 
     pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-    img_arr = convert_state_to_image(
-        np.asarray(pointcloud.points), np.asarray(pointcloud.colors)
+    points = np.asarray(pointcloud.points)
+    ctr = np.array(
+        [np.mean(points[:, 0]), np.mean(points[:, 1]), np.mean(points[:, 2])]
     )
-    np.save(save_path + "/pcl0.npy", pointcloud)
+    centered_points = center_pcl(points, ctr)
+    img_arr = convert_state_to_image(centered_points, np.asarray(pointcloud.colors))
+    np.save(save_path + "/pcl0.npy", centered_points)
     np.save(save_path + "/img0.npy", img_arr)
-
-    cd = chamfer(pointcloud, goal)
-    earthmovers = emd(pointcloud, goal)
-    hausdorff_dist = hausdorff(pointcloud, goal)
-    print("\nChamfer Distance: ", cd)
-    print("Earth Mover's Distance: ", earthmovers)
-    print("Hausdorff Distance: ", hausdorff_dist)
 
     # load policy and stats
     policy_class = experiment_config["policy_class"]
@@ -316,6 +333,18 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
             rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
             rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
+            # distance metrics between point cloud and goal
+            # TODO: make pc copies -> unormalize_point_clouds
+            # TODO: lab color crop -> downsample
+            pointcloud_clay_only = ...  # TODO
+            cd = chamfer(pointcloud_clay_only, goal)
+            earthmovers = emd(pointcloud_clay_only, goal)
+            hausdorff_dist = hausdorff(pointcloud_clay_only, goal)
+            print("\nChamfer Distance: ", cd)
+            print("Earth Mover's Distance: ", earthmovers)
+            print("Hausdorff Distance: ", hausdorff_dist)
+
+            # processing for pointcloud to image
             pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
             pc3.transform(cameras["3"].get_cam_extrinsics())
             pc4.transform(cameras["4"].get_cam_extrinsics())
@@ -334,20 +363,16 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
             cv2.imwrite(save_path + "/rgb5_state" + str(t + 1) + ".jpg", rgb5)
 
             pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-            img_arr = convert_state_to_image(
-                np.asarray(pointcloud.points), np.asarray(pointcloud.colors)
+            points = np.asarray(pointcloud.points)
+            ctr = np.array(
+                [np.mean(points[:, 0]), np.mean(points[:, 1]), np.mean(points[:, 2])]
             )
-            np.save(save_path + "/pcl0.npy", pointcloud)
-            np.save(save_path + "/pcl" + str(t + 1) + ".npy", pointcloud)
+            centered_points = center_pcl(points, ctr)
+            img_arr = convert_state_to_image(
+                centered_points, np.asarray(pointcloud.colors)
+            )
+            np.save(save_path + "/pcl" + str(t + 1) + ".npy", centered_points)
             np.save(save_path + "/img" + str(t + 1) + ".npy", img_arr)
-
-            # get the distance metrics between the point cloud and goal
-            cd = chamfer(pointcloud, goal)
-            earthmovers = emd(pointcloud, goal)
-            hausdorff_dist = hausdorff(pointcloud, goal)
-            print("\nChamfer Distance: ", cd)
-            print("Earth Mover's Distance: ", earthmovers)
-            print("Hausdorff Distance: ", hausdorff_dist)
 
             # exit loop early if the goal is reached
             if earthmovers < 0.01 or cd < 0.01:

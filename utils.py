@@ -133,11 +133,6 @@ class ClayDataset(torch.utils.data.Dataset):
         # deterime the augmentation interval
         self.aug_step = 360 / self.n_datapoints_per_trajectory
 
-    def _center_pcl(self, pcl, center):
-        centered_pcl = pcl - center
-        centered_pcl = centered_pcl * 10
-        return centered_pcl
-
     def _center_normalize_action(self, action, ctr):
         # center the action
         new_action = np.zeros(5)
@@ -253,7 +248,7 @@ class ClayDataset(torch.utils.data.Dataset):
 
         # apply state augmentation
         s_rot = self._rotate_pcl(state, ctr, aug_rot)  # apply state rotation
-        s_rot_scaled = self._center_pcl(s_rot, ctr)  # center and scale state
+        s_rot_scaled = center_pcl(s_rot, ctr)  # center and scale state
 
         img_arr = convert_state_to_image(s_rot_scaled, np.asarray(state.colors))
         all_cam_images = np.stack([img_arr], axis=0)
@@ -298,6 +293,12 @@ class ClayDataset(torch.utils.data.Dataset):
         # ]
 
         return image_data, prev_action_data, action_data, is_pad
+
+
+def center_pcl(pcl, center):
+    centered_pcl = pcl - center
+    centered_pcl = centered_pcl * 10
+    return centered_pcl
 
 
 def stitch_state_pcls(pc2, pc3, pc4, pc5):
