@@ -49,6 +49,7 @@ def main(args):
     # task parameters
     task_config = TASK_CONFIGS[task_name]
     episode_len = task_config["episode_len"]
+    camera_names = task_config["camera_names"]
 
     # hardware parameters
     hardware_config = HARDWARE_CONFIGS
@@ -73,7 +74,7 @@ def main(args):
             "enc_layers": enc_layers,
             "dec_layers": dec_layers,
             "nheads": nheads,
-            "state_dim": state_dim,
+            "camera_names": camera_names,
         }
     elif policy_class == "CNNMLP":
         policy_config = {
@@ -162,7 +163,7 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     a_mins5d = hardware_config["a_mins5d"]
     a_maxs5d = hardware_config["a_maxs5d"]
     policy_config = experiment_config["policy_config"]
-    state_dim = policy_config["state_dim"]
+    state_dim = experiment_config["state_dim"]
 
     # go to observation pose
     pose = robot.get_pose()
@@ -175,29 +176,19 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     # get the starting time
     start_time = time.time()
 
-    # save initial observation state
+    # get initial observation state
     rgb2, _, pc2, _ = cameras["2"]._get_next_frame()
     rgb3, _, pc3, _ = cameras["3"]._get_next_frame()
     rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
     rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
-    # distance metrics between point cloud and goal
-    # TODO: make pc copies -> unormalize_point_clouds
-    # TODO: lab color crop -> downsample
-    pointcloud_clay_only = ...  # TODO
-    cd = chamfer(pointcloud_clay_only, goal)
-    earthmovers = emd(pointcloud_clay_only, goal)
-    hausdorff_dist = hausdorff(pointcloud_clay_only, goal)
-    print("\nChamfer Distance: ", cd)
-    print("Earth Mover's Distance: ", earthmovers)
-    print("Hausdorff Distance: ", hausdorff_dist)
-
-    # processing for pointcloud to image
-    pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
+    # transform to robot frame
+    pc2.transform(cameras["2"].get_cam_extrinsics())
     pc3.transform(cameras["3"].get_cam_extrinsics())
     pc4.transform(cameras["4"].get_cam_extrinsics())
     pc5.transform(cameras["5"].get_cam_extrinsics())
 
+    # save observation
     o3d.io.write_point_cloud(save_path + "/cam2_pcl0.ply", pc2)
     o3d.io.write_point_cloud(save_path + "/cam3_pcl0.ply", pc3)
     o3d.io.write_point_cloud(save_path + "/cam4_pcl0.ply", pc4)
@@ -208,21 +199,41 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     cv2.imwrite(save_path + "/rgb4_state0.jpg", rgb4)
     cv2.imwrite(save_path + "/rgb5_state0.jpg", rgb5)
 
-    pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-    points = np.asarray(pointcloud.points)
+    # distance metrics between point cloud and goal
+    pcl_vis = vis.Vision3D()
+    eval_points, eval_pcl_center = pcl_vis.unnormalize_fuse_point_clouds(
+        pc2, pc3, pc4, pc5, no_transformation=True
+    )  # pcl for evaluation (cropped and downsampled)
+    dist_metrics = {
+        "CD": chamfer(eval_points, goal),
+        "EMD": emd(eval_points, goal),
+        "HAUSDORFF": hausdorff(eval_points, goal),
+    }
+    print("\nDists: ", dist_metrics)
+    with open(save_path + "/dist_metrics_0.txt", "w") as f:
+        f.write(str(dist_metrics))
+    np.save(save_path + "/pcl0.npy", eval_points)
+
+    # point cloud for image passed into ACT model (includes table)
+    model_pcl = stitch_state_pcls(pc2, pc3, pc4, pc5)
+    model_points = np.asarray(model_pcl.points)
     ctr = np.array(
-        [np.mean(points[:, 0]), np.mean(points[:, 1]), np.mean(points[:, 2])]
+        [
+            np.mean(model_points[:, 0]),
+            np.mean(model_points[:, 1]),
+            np.mean(model_points[:, 2]),
+        ]
     )
-    centered_points = center_pcl(points, ctr)
-    img_arr = convert_state_to_image(centered_points, np.asarray(pointcloud.colors))
-    np.save(save_path + "/pcl0.npy", centered_points)
+    centered_points = center_pcl(model_points, ctr)
+    img_arr = convert_state_to_image(centered_points, np.asarray(model_pcl.colors))
+    np.save(save_path + "/ACT_pcl0.npy", centered_points)
     np.save(save_path + "/img0.npy", img_arr)
 
     # load policy and stats
     policy_class = experiment_config["policy_class"]
     policy_config = experiment_config["policy_config"]
     ckpt_dir = experiment_config["ckpt_dir"]
-    temporal_agg = experiment_config["temoporal_agg"]
+    temporal_agg = experiment_config["temporal_agg"]
 
     ckpt_path = os.path.join(ckpt_dir, "policy_best.ckpt")
     policy = make_policy(policy_class, policy_config)
@@ -249,9 +260,10 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     with torch.inference_mode():
         for t in range(max_timesteps):
             # process image
-            image_data = torch.from_numpy(np.stack([img_arr], axis=0))
+            all_cam_images = np.stack([img_arr], axis=0)
+            image_data = torch.from_numpy(all_cam_images).cuda()
             image_data = torch.einsum("k h w c -> k c h w", image_data)
-            curr_image = image_data / 255.0
+            curr_image = (image_data / 255.0).unsqueeze(0)
 
             if t == 0:
                 robot_action = hardware_config["initial_action"]
@@ -259,6 +271,12 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
             # query policy
             if experiment_config["policy_class"] == "ACT":
                 if t % query_frequency == 0:
+                    robot_action = (
+                        torch.from_numpy(robot_action)
+                        .cuda()
+                        .type(torch.float32)
+                        .unsqueeze(0)
+                    )
                     all_actions = policy(robot_action, curr_image)
                 if temporal_agg:
                     all_time_actions[[t], t : t + num_queries] = all_actions
@@ -281,7 +299,7 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
 
             # convert action into robot space and go to pose
             raw_action = raw_action.squeeze(0).cpu().numpy()
-            robot_action = get_real_action_from_normalized(raw_action)
+            robot_action = raw_action * (a_maxs5d - a_mins5d) + a_mins5d
             goto_grasp(
                 robot,
                 robot_action[0],
@@ -301,7 +319,6 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
             # unnorm_a = (
             #     pred_action + 1
             # ) / 2.0  # NOTE: this step is for the model to output actions in the range [-1, 1], if the model outputs actions in the range [0, 1], this step is not necessary
-            # unnorm_a = unnorm_a * (a_maxs5d - a_mins5d) + a_mins5d
 
             # execute the unnormalized action
             # goto_grasp(
@@ -327,55 +344,62 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
             pose.translation = observation_pose
             robot.goto_pose(pose)
 
-            # save observation state
+            # get observation state
             rgb2, _, pc2, _ = cameras["2"]._get_next_frame()
             rgb3, _, pc3, _ = cameras["3"]._get_next_frame()
             rgb4, _, pc4, _ = cameras["4"]._get_next_frame()
             rgb5, _, pc5, _ = cameras["5"]._get_next_frame()
 
-            # distance metrics between point cloud and goal
-            # TODO: make pc copies -> unormalize_point_clouds
-            # TODO: lab color crop -> downsample
-            pointcloud_clay_only = ...  # TODO
-            cd = chamfer(pointcloud_clay_only, goal)
-            earthmovers = emd(pointcloud_clay_only, goal)
-            hausdorff_dist = hausdorff(pointcloud_clay_only, goal)
-            print("\nChamfer Distance: ", cd)
-            print("Earth Mover's Distance: ", earthmovers)
-            print("Hausdorff Distance: ", hausdorff_dist)
-
-            # processing for pointcloud to image
-            pc2.transform(cameras["2"].get_cam_extrinsics())  # transform to robot frame
+            # transform to robot frame
+            pc2.transform(cameras["2"].get_cam_extrinsics())
             pc3.transform(cameras["3"].get_cam_extrinsics())
             pc4.transform(cameras["4"].get_cam_extrinsics())
             pc5.transform(cameras["5"].get_cam_extrinsics())
 
+            # save observations
             o3d.io.write_point_cloud(save_path + "/cam2_pcl" + str(t + 1) + ".ply", pc2)
             o3d.io.write_point_cloud(save_path + "/cam3_pcl" + str(t + 1) + ".ply", pc3)
             o3d.io.write_point_cloud(save_path + "/cam4_pcl" + str(t + 1) + ".ply", pc4)
             o3d.io.write_point_cloud(save_path + "/cam5_pcl" + str(t + 1) + ".ply", pc5)
 
-            # save observation
-            np.save(save_path + "/pcl" + str(t + 1) + ".npy", pointcloud)
             cv2.imwrite(save_path + "/rgb2_state" + str(t + 1) + ".jpg", rgb2)
             cv2.imwrite(save_path + "/rgb3_state" + str(t + 1) + ".jpg", rgb3)
             cv2.imwrite(save_path + "/rgb4_state" + str(t + 1) + ".jpg", rgb4)
             cv2.imwrite(save_path + "/rgb5_state" + str(t + 1) + ".jpg", rgb5)
 
-            pointcloud = stitch_state_pcls(pc2, pc3, pc4, pc5)
-            points = np.asarray(pointcloud.points)
+            # distance metrics between point cloud and goal
+            eval_points, eval_pcl_center = pcl_vis.unnormalize_fuse_point_clouds(
+                pc2, pc3, pc4, pc5, no_transformation=True
+            )  # pcl for evaluation (cropped and downsampled)
+            dist_metrics = {
+                "CD": chamfer(eval_points, goal),
+                "EMD": emd(eval_points, goal),
+                "HAUSDORFF": hausdorff(eval_points, goal),
+            }
+            print("\nDists: ", dist_metrics)
+            with open(save_path + "/dist_metrics_" + str(t + 1) + ".txt", "w") as f:
+                f.write(str(dist_metrics))
+            np.save(save_path + "/pcl" + str(t + 1) + ".npy", eval_points)
+
+            # point cloud for image passed into ACT model (includes table)
+            model_pcl = stitch_state_pcls(pc2, pc3, pc4, pc5)
+            model_points = np.asarray(model_pcl.points)
             ctr = np.array(
-                [np.mean(points[:, 0]), np.mean(points[:, 1]), np.mean(points[:, 2])]
+                [
+                    np.mean(model_points[:, 0]),
+                    np.mean(model_points[:, 1]),
+                    np.mean(model_points[:, 2]),
+                ]
             )
-            centered_points = center_pcl(points, ctr)
+            centered_points = center_pcl(model_points, ctr)
             img_arr = convert_state_to_image(
-                centered_points, np.asarray(pointcloud.colors)
+                centered_points, np.asarray(model_pcl.colors)
             )
-            np.save(save_path + "/pcl" + str(t + 1) + ".npy", centered_points)
+            np.save(save_path + "/ACT_pcl" + str(t + 1) + ".npy", centered_points)
             np.save(save_path + "/img" + str(t + 1) + ".npy", img_arr)
 
             # exit loop early if the goal is reached
-            if earthmovers < 0.01 or cd < 0.01:
+            if dist_metrics["EMD"] < 0.01 or dist_metrics["CD"] < 0.01:
                 break
 
             # alternate break scenario --> if the past 3 actions have not resulted in a decent change in the emd or cd, break
@@ -390,8 +414,9 @@ def experiment_loop(robot, cameras, experiment_config, save_path, goal, done_que
     results_dict = {
         "n_actions": n_action,
         "time_to_completion": end_time - start_time,
-        "chamfer_distance": cd,
-        "earth_movers_distance": emd,
+        "chamfer_distance": dist_metrics["CD"],
+        "earth_movers_distance": dist_metrics["EMD"],
+        "hausdorff": dist_metrics["HAUSDORFF"],
     }
     with open(save_path + "/results.txt", "w") as f:
         f.write(str(results_dict))
